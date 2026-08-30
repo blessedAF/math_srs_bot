@@ -1,0 +1,18 @@
+[Unit]
+Description=Math SRS Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+WorkingDirectory=/home/REPLACE_USER/math_srs_bot
+EnvironmentFile=/home/REPLACE_USER/math_srs_bot/.env
+ExecStart=/home/REPLACE_USER/math_srs_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+# Чтобы бот не «засыпал» вместе с GUI-сессией
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

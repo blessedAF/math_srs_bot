@@ -1,10 +1,11 @@
 """
 Заливает карточки из seed_cards.json в базу для указанного user_id.
 
+Существующие карточки (тот же front у того же user_id) обновляются
+(формула/тема), прогресс SM-2 не сбрасывается. Новые — добавляются.
+
 Использование:
     python import_seed.py <твой_telegram_user_id>
-
-Узнать свой user_id можно у бота @userinfobot в Telegram.
 """
 
 import json
@@ -26,16 +27,23 @@ def main() -> None:
 
     db.init_db()
     added = 0
+    updated = 0
     for card in cards:
-        db.add_card(
-            user_id=user_id,
-            front=card["front"],
-            back=card["back"],
-            topic=card.get("topic", ""),
-        )
-        added += 1
+        front = card["front"]
+        back = card["back"]
+        topic = card.get("topic", "")
+        existing = db.find_card_by_front(user_id, front)
+        if existing is None:
+            db.add_card(user_id=user_id, front=front, back=back, topic=topic)
+            added += 1
+        else:
+            db.update_card_text(existing["id"], back, topic)
+            updated += 1
 
-    print(f"Добавлено {added} карточек для user_id={user_id}")
+    print(
+        f"Готово для user_id={user_id}: добавлено {added}, "
+        f"обновлено {updated}, всего в файле {len(cards)}"
+    )
 
 
 if __name__ == "__main__":

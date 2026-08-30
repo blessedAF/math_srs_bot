@@ -35,9 +35,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -45,6 +47,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import render
 import sm2
 
 load_dotenv()
@@ -136,8 +139,29 @@ def format_card_full(front: str, back: str, topic: str) -> str:
     text = f"📋 <b>{esc(front)}</b>"
     if topic:
         text += f"\n🏷 <i>{esc(topic)}</i>"
-    text += f"\n\n➡️ <code>{esc(back)}</code>"
+    text += f"\n\n➡️ {esc(back)}"
     return text
+
+
+def _card_png(
+    card,
+    *,
+    revealed: bool,
+    progress: str = "",
+    footer: str = "",
+) -> bytes:
+    return render.render_card(
+        card["front"],
+        card["back"],
+        card["topic"] or "",
+        revealed=revealed,
+        progress=progress,
+        footer=footer,
+    )
+
+
+def _photo(png: bytes, name: str = "card.png") -> BufferedInputFile:
+    return BufferedInputFile(png, filename=name)
 
 
 # ---------- Базовые команды ----------
@@ -165,7 +189,9 @@ async def cmd_help(message: Message) -> None:
         f"{BTN_LIST} — список всех карточек с ID\n"
         f"{BTN_STATS} — сколько карточек всего и на сегодня\n\n"
         "Во время повторения можно удалить карточку кнопкой 🗑, "
-        "или командой /delete &lt;id&gt; в любой момент."
+        "или командой /delete &lt;id&gt; в любой момент.\n\n"
+        "Формулы пиши в LaTeX между долларами, например:\n"
+        "<code>$a+b \\ge 2\\sqrt{ab}$</code>"
     )
 
 
@@ -242,7 +268,10 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 async def add_front(message: Message, state: FSMContext) -> None:
     await state.update_data(front=message.text)
     await state.set_state(AddCard.waiting_back)
-    await message.answer("✏️ Теперь введи <b>ответ</b> (формула / формулировка / доказательство).")
+    await message.answer(
+        "✏️ Теперь введи <b>ответ</b> (формула / формулировка).\n"
+        "LaTeX: <code>$c^2 = a^2+b^2-2ab\\cos C$</code>"
+    )
 
 
 @router.message(AddCard.waiting_back)
@@ -309,9 +338,17 @@ async def _send_next_card(message: Message, state: FSMContext) -> None:
         return
 
     position = total - len(queue) + 1
-    progress = f"<i>Карточка {position} из {total}</i>\n\n"
-    text = progress + format_card_front(card["front"], card["topic"])
-    await message.answer(text, reply_markup=show_answer_keyboard(card_id))
+    progress = f"карточка {position} из {total}"
+    try:
+        png = _card_png(card, revealed=False, progress=progress)
+        await message.answer_photo(
+            _photo(png),
+            reply_markup=show_answer_keyboard(card_id),
+        )
+    except Exception:
+        logging.exception("не удалось срендерить карточку #%s", card_id)
+        text = f"<i>{esc(progress)}</i>\n\n" + format_card_front(card["front"], card["topic"])
+        await message.answer(text, reply_markup=show_answer_keyboard(card_id))
 
 
 @router.callback_query(F.data.startswith("show:"))
@@ -321,10 +358,23 @@ async def show_answer(callback: CallbackQuery, state: FSMContext) -> None:
     if card is None:
         await callback.answer("Карточка не найдена")
         return
-    await callback.message.edit_text(
-        format_card_full(card["front"], card["back"], card["topic"]),
-        reply_markup=grade_keyboard(card_id),
-    )
+    data = await state.get_data()
+    queue = data.get("queue", [])
+    total = data.get("total", 1)
+    position = total - len(queue) + 1 if queue else total
+    progress = f"карточка {position} из {total}"
+    try:
+        png = _card_png(card, revealed=True, progress=progress)
+        await callback.message.edit_media(
+            InputMediaPhoto(media=_photo(png, "answer.png")),
+            reply_markup=grade_keyboard(card_id),
+        )
+    except Exception:
+        logging.exception("не удалось показать ответ #%s", card_id)
+        await callback.message.answer(
+            format_card_full(card["front"], card["back"], card["topic"]),
+            reply_markup=grade_keyboard(card_id),
+        )
     await callback.answer()
 
 
@@ -332,7 +382,14 @@ async def show_answer(callback: CallbackQuery, state: FSMContext) -> None:
 async def delete_during_review(callback: CallbackQuery, state: FSMContext) -> None:
     card_id = int(callback.data.split(":")[1])
     deleted = db.delete_card(card_id, callback.from_user.id)
-    await callback.message.edit_text("🗑 Карточка удалена." if deleted else "Карточка не найдена.")
+    notice = "🗑 Карточка удалена." if deleted else "Карточка не найдена."
+    try:
+        await callback.message.edit_caption(notice)
+    except Exception:
+        try:
+            await callback.message.edit_text(notice)
+        except Exception:
+            await callback.message.answer(notice)
     await callback.answer()
 
     data = await state.get_data()
@@ -362,12 +419,27 @@ async def grade_answer(callback: CallbackQuery, state: FSMContext) -> None:
     db.update_card_review(card_id, result.ease, result.interval, result.repetitions, next_date)
 
     grade_emoji = {"again": "😵", "good": "🙂", "easy": "😎"}[grade]
-    summary = format_card_full(card["front"], card["back"], card["topic"])
-    summary += (
-        f"\n\n{grade_emoji} Оценено. Следующее повторение: "
-        f"<b>{next_date.strftime('%d.%m.%Y')}</b> (через {result.interval} дн.)"
+    footer = (
+        f"{grade_emoji} следующее повторение: {next_date.strftime('%d.%m.%Y')} "
+        f"(через {result.interval} дн.)"
     )
-    await callback.message.edit_text(summary)
+    data = await state.get_data()
+    queue = data.get("queue", [])
+    total = data.get("total", 1)
+    position = total - len(queue) + 1 if queue else total
+    try:
+        png = _card_png(
+            card,
+            revealed=True,
+            progress=f"карточка {position} из {total}",
+            footer=footer,
+        )
+        await callback.message.edit_media(InputMediaPhoto(media=_photo(png, "graded.png")))
+    except Exception:
+        logging.exception("не удалось обновить карточку после оценки #%s", card_id)
+        await callback.message.answer(
+            format_card_full(card["front"], card["back"], card["topic"]) + f"\n\n{esc(footer)}"
+        )
     await callback.answer()
 
     data = await state.get_data()

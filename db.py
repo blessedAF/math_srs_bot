@@ -106,6 +106,22 @@ def list_cards(user_id: int, limit: int = 50) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def find_card_by_front(user_id: int, front: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM cards WHERE user_id = ? AND front = ? LIMIT 1",
+            (user_id, front),
+        ).fetchone()
+
+
+def update_card_text(card_id: int, back: str, topic: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cards SET back = ?, topic = ? WHERE id = ?",
+            (back, topic, card_id),
+        )
+
+
 def list_topics(user_id: int) -> list[str]:
     with get_conn() as conn:
         rows = conn.execute(
