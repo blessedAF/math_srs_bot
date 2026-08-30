@@ -9,12 +9,16 @@ import io
 import logging
 import re
 import textwrap
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import colors as mcolors
+from matplotlib import mathtext
+from matplotlib.font_manager import FontProperties
 from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger(__name__)
@@ -82,44 +86,50 @@ def sanitize_math(latex: str) -> str:
     return s
 
 
+# Парсер переиспользуется между вызовами. 'agg' отдаёт готовый растр
+# (маску покрытия) напрямую, без создания Figure/Axes и без прохода
+# через PNG-кодирование/декодирование — это и есть основной источник
+# ускорения по сравнению со старым Figure+savefig(bbox_inches="tight").
+_MATH_PARSER = mathtext.MathTextParser("agg")
+
+
+@lru_cache(maxsize=512)
+def _render_latex_cached(expr: str, fontsize: int, color: str, dpi: int = 200) -> Image.Image:
+    """Рендерит LaTeX-формулу в прозрачное RGBA-изображение напрямую из
+    растровой маски matplotlib, без промежуточного PNG. Кэшируется по
+    (expr, fontsize, color) — одна и та же формула, которую в spaced
+    repetition показывают многократно (при показе ответа, при оценке,
+    при повторных показах карточки через дни), рендерится только один
+    раз за время жизни процесса.
+    """
+    prop = FontProperties(size=fontsize)
+    raster = _MATH_PARSER.parse(expr, dpi=dpi, prop=prop)
+    alpha = np.asarray(raster.image)  # маска покрытия (0..255), форма (h, w)
+
+    r, g, b = (int(c * 255) for c in mcolors.to_rgb(color))
+    h, w = alpha.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = r
+    rgba[..., 1] = g
+    rgba[..., 2] = b
+    rgba[..., 3] = alpha
+    return Image.fromarray(rgba, mode="RGBA")
+
+
 def render_latex(latex: str, fontsize: int = 26, color: str = "#201a12") -> Image.Image:
     """Рендерит один LaTeX-фрагмент в прозрачный PNG."""
     expr = sanitize_math(latex.strip())
     if expr.startswith("$") and expr.endswith("$"):
         expr = expr[1:-1].strip()
     expr = rf"${expr}$"
-    fig = None
-    try:
-        fig = plt.figure(figsize=(10, 2.4), dpi=200)
-        fig.patch.set_alpha(0.0)
-        fig.text(
-            0.5,
-            0.5,
-            expr,
-            fontsize=fontsize,
-            ha="center",
-            va="center",
-            color=color,
-        )
-        buf = io.BytesIO()
-        fig.savefig(
-            buf,
-            format="png",
-            transparent=True,
-            bbox_inches="tight",
-            pad_inches=0.12,
-            facecolor="none",
-        )
-        buf.seek(0)
-        img = Image.open(buf).convert("RGBA")
-        max_w = CARD_W - 2 * PAD
-        if img.width > max_w:
-            ratio = max_w / img.width
-            img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
-        return img
-    finally:
-        if fig is not None:
-            plt.close(fig)
+
+    img = _render_latex_cached(expr, fontsize, color)
+
+    max_w = CARD_W - 2 * PAD
+    if img.width > max_w:
+        ratio = max_w / img.width
+        img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
+    return img
 
 
 def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
@@ -269,7 +279,12 @@ def render_card(
         draw.text((PAD, y), footer, font=footer_font, fill=ACCENT)
 
     out = io.BytesIO()
-    canvas.convert("RGB").save(out, format="PNG", optimize=True)
+    # optimize=True пересчитывает PNG-фильтры несколько раз ради чуть
+    # меньшего файла — это стоило ~80% времени всего рендера карточки
+    # (см. профилирование). Telegram всё равно перекодирует фото на своей
+    # стороне, так что compress_level=1 (быстрое сжатие) даёт файл чуть
+    # крупнее, но рендерится в разы быстрее.
+    canvas.convert("RGB").save(out, format="PNG", compress_level=1)
     return out.getvalue()
 
 

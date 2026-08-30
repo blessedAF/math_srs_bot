@@ -340,7 +340,7 @@ async def _send_next_card(message: Message, state: FSMContext) -> None:
     position = total - len(queue) + 1
     progress = f"карточка {position} из {total}"
     try:
-        png = _card_png(card, revealed=False, progress=progress)
+        png = await asyncio.to_thread(_card_png, card, revealed=False, progress=progress)
         await message.answer_photo(
             _photo(png),
             reply_markup=show_answer_keyboard(card_id),
@@ -364,7 +364,7 @@ async def show_answer(callback: CallbackQuery, state: FSMContext) -> None:
     position = total - len(queue) + 1 if queue else total
     progress = f"карточка {position} из {total}"
     try:
-        png = _card_png(card, revealed=True, progress=progress)
+        png = await asyncio.to_thread(_card_png, card, revealed=True, progress=progress)
         await callback.message.edit_media(
             InputMediaPhoto(media=_photo(png, "answer.png")),
             reply_markup=grade_keyboard(card_id),
@@ -428,7 +428,8 @@ async def grade_answer(callback: CallbackQuery, state: FSMContext) -> None:
     total = data.get("total", 1)
     position = total - len(queue) + 1 if queue else total
     try:
-        png = _card_png(
+        png = await asyncio.to_thread(
+            _card_png,
             card,
             revealed=True,
             progress=f"карточка {position} из {total}",
