@@ -8,7 +8,6 @@ from __future__ import annotations
 import io
 import logging
 import re
-import textwrap
 from functools import lru_cache
 from pathlib import Path
 
@@ -34,18 +33,18 @@ PAD = 48
 _MATH_SPLIT = re.compile(r"(\$\$.*?\$\$|\$(?:\\\$|[^$])+\$)", re.DOTALL)
 
 _FONT_REGULAR = [
-    Path(r"C:\Windows\Fonts\segoeui.ttf"),
-    Path(r"C:\Windows\Fonts\arial.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
     Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+    Path(r"C:\Windows\Fonts\segoeui.ttf"),
+    Path(r"C:\Windows\Fonts\arial.ttf"),
 ]
 _FONT_BOLD = [
-    Path(r"C:\Windows\Fonts\segoeuib.ttf"),
-    Path(r"C:\Windows\Fonts\arialbd.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
     Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
     Path("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    Path(r"C:\Windows\Fonts\segoeuib.ttf"),
+    Path(r"C:\Windows\Fonts\arialbd.ttf"),
 ]
 
 
@@ -90,20 +89,29 @@ def sanitize_math(latex: str) -> str:
 # (маску покрытия) напрямую, без создания Figure/Axes и без прохода
 # через PNG-кодирование/декодирование — это и есть основной источник
 # ускорения по сравнению со старым Figure+savefig(bbox_inches="tight").
+# dpi=72 выбран специально: при нём 1pt fontsize == 1px, поэтому размер
+# формулы в пикселях предсказуемо совпадает с fontsize — это позволяет
+# подобрать INLINE_MATH_FONTSIZE так, чтобы маленькие формулы внутри
+# предложения визуально сливались с обычным текстом по высоте и базовой
+# линии, а не были каждая на отдельной строке огромным блоком.
 _MATH_PARSER = mathtext.MathTextParser("agg")
+_MATH_DPI = 72
+DISPLAY_MATH_FONTSIZE = 72  # крупная формула на отдельной строке (было ~72px и при dpi=200,fontsize=26)
+INLINE_MATH_FONTSIZE = 28  # подобрано опытным путём под BODY_FONT_SIZE=26
 
 
 @lru_cache(maxsize=512)
-def _render_latex_cached(expr: str, fontsize: int, color: str, dpi: int = 200) -> Image.Image:
+def _render_latex_raw(expr: str, fontsize: int, color: str) -> tuple[Image.Image, float, float]:
     """Рендерит LaTeX-формулу в прозрачное RGBA-изображение напрямую из
-    растровой маски matplotlib, без промежуточного PNG. Кэшируется по
+    растровой маски matplotlib, без промежуточного PNG. Возвращает
+    (картинка, height, depth) — height/depth нужны для выравнивания по
+    базовой линии при вставке формулы в поток текста. Кэшируется по
     (expr, fontsize, color) — одна и та же формула, которую в spaced
-    repetition показывают многократно (при показе ответа, при оценке,
-    при повторных показах карточки через дни), рендерится только один
-    раз за время жизни процесса.
+    repetition показывают многократно, рендерится только один раз за
+    время жизни процесса.
     """
     prop = FontProperties(size=fontsize)
-    raster = _MATH_PARSER.parse(expr, dpi=dpi, prop=prop)
+    raster = _MATH_PARSER.parse(expr, dpi=_MATH_DPI, prop=prop)
     alpha = np.asarray(raster.image)  # маска покрытия (0..255), форма (h, w)
 
     r, g, b = (int(c * 255) for c in mcolors.to_rgb(color))
@@ -113,23 +121,38 @@ def _render_latex_cached(expr: str, fontsize: int, color: str, dpi: int = 200) -
     rgba[..., 1] = g
     rgba[..., 2] = b
     rgba[..., 3] = alpha
-    return Image.fromarray(rgba, mode="RGBA")
+    img = Image.fromarray(rgba, mode="RGBA")
+    return img, raster.height, raster.depth
 
 
-def render_latex(latex: str, fontsize: int = 26, color: str = "#201a12") -> Image.Image:
-    """Рендерит один LaTeX-фрагмент в прозрачный PNG."""
+def _prepare_expr(latex: str) -> str:
     expr = sanitize_math(latex.strip())
     if expr.startswith("$") and expr.endswith("$"):
         expr = expr[1:-1].strip()
-    expr = rf"${expr}$"
+    return rf"${expr}$"
 
-    img = _render_latex_cached(expr, fontsize, color)
+
+def render_latex(latex: str, fontsize: int = DISPLAY_MATH_FONTSIZE, color: str = "#201a12") -> Image.Image:
+    """Рендерит один LaTeX-фрагмент в прозрачный PNG (для крупных display-формул)."""
+    expr = _prepare_expr(latex)
+    img, _height, _depth = _render_latex_raw(expr, fontsize, color)
 
     max_w = CARD_W - 2 * PAD
     if img.width > max_w:
         ratio = max_w / img.width
         img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
     return img
+
+
+def render_inline_math(latex: str, color: str = "#201a12") -> tuple[Image.Image, int]:
+    """Рендерит формулу в размере, подобранном под обычный текст (для
+    вставки внутрь предложения). Возвращает (картинка, depth_px) —
+    depth нужен вызывающему коду, чтобы выровнять формулу по базовой
+    линии окружающего текста.
+    """
+    expr = _prepare_expr(latex)
+    img, height, depth = _render_latex_raw(expr, INLINE_MATH_FONTSIZE, color)
+    return img, round(depth)
 
 
 def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
@@ -147,6 +170,107 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[st
             cur = word
     lines.append(cur)
     return lines
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+
+
+_GLUE_LEFT = re.compile(r"^[,.;:!?)\]}]")
+_OPEN_BRACKETS = set("([{")
+
+
+def _tokenize_paragraph(paragraph: str) -> list[tuple[str, str, bool]]:
+    """Разбивает параграф на атомы потока: ('word'|'math', payload, glue_left).
+    glue_left=True означает «не ставить пробел перед этим атомом» —
+    нужно для запятых/точек (глядя назад) и для атомов сразу после
+    открывающей скобки вроде "(" (глядя вперёд)."""
+    atoms: list[tuple[str, str, bool]] = []
+    pending_glue = False  # следующий атом клеится к предыдущему без пробела
+    for chunk in _MATH_SPLIT.split(paragraph):
+        if chunk == "":
+            continue
+        if _is_math(chunk):
+            atoms.append(("math", _unwrap_math(chunk), pending_glue))
+            pending_glue = False
+        else:
+            for word in chunk.split():
+                glue = pending_glue or (bool(atoms) and bool(_GLUE_LEFT.match(word)))
+                atoms.append(("word", word, glue))
+                pending_glue = bool(word) and word[-1] in _OPEN_BRACKETS
+    return atoms
+
+
+def _layout_flow(
+    draw: ImageDraw.ImageDraw, atoms: list[tuple[str, str, bool]], body_font, max_width: int
+) -> tuple[list[dict], int]:
+    """Раскладывает смешанный текст+формулы по строкам с переносом,
+    выравнивая всё по общей базовой линии — так короткие формулы
+    вроде "$f$" или "$w_i \\ge 0$" встраиваются в предложение как
+    обычное слово, а не превращаются в отдельный гигантский блок.
+    """
+    asc, desc = body_font.getmetrics()
+    space_w = draw.textlength(" ", font=body_font)
+
+    lines: list[dict] = []
+    # каждый элемент cur_items: (kind, payload, w, h, d, glue_left)
+    cur_items: list[tuple] = []
+    cur_width = 0.0
+
+    def flush_line() -> None:
+        nonlocal cur_items, cur_width
+        if not cur_items:
+            return
+        baseline = float(asc)
+        max_depth = float(desc)
+        for kind, _payload, _w, h, d, _glue in cur_items:
+            if kind == "math":
+                baseline = max(baseline, h - d)
+                max_depth = max(max_depth, d)
+        line_height = baseline + max_depth
+        items = []
+        x = 0.0
+        for i, (kind, payload, w, h, d, glue) in enumerate(cur_items):
+            if i > 0 and not glue:
+                x += space_w
+            y_off = baseline - asc if kind == "word" else baseline - (h - d)
+            items.append((x, y_off, kind, payload))
+            x += w
+        lines.append({"items": items, "height": line_height})
+        cur_items = []
+        cur_width = 0.0
+
+    for kind, payload, glue in atoms:
+        if kind == "word":
+            w = draw.textlength(payload, font=body_font)
+            h = float(asc + desc)
+            d = float(desc)
+            item_payload = payload
+        else:
+            try:
+                img, depth = render_inline_math(payload)
+            except Exception:
+                log.exception("не удалось срендерить inline-формулу: %s", payload)
+                kind = "word"
+                item_payload = payload
+                w = draw.textlength(payload, font=body_font)
+                h = float(asc + desc)
+                d = float(desc)
+            else:
+                item_payload = img
+                w = img.width
+                h = float(img.height)
+                d = float(depth)
+        gap = 0.0 if (glue or not cur_items) else space_w
+        if cur_items and cur_width + gap + w > max_width:
+            flush_line()
+            gap = 0.0  # первый элемент новой строки — без ведущего пробела
+        cur_items.append((kind, item_payload, w, h, d, glue or not cur_items))
+        cur_width += gap + w
+    flush_line()
+
+    total_height = sum(int(round(l["height"])) + 10 for l in lines)
+    return lines, total_height
 
 
 def _paste(canvas: Image.Image, piece: Image.Image, y: int) -> int:
@@ -198,41 +322,41 @@ def render_card(
     y += 28
 
     body_blocks: list[tuple[str, object]] = []
+    max_text_w = CARD_W - 2 * PAD
 
     if revealed:
-        chunks = [c for c in _MATH_SPLIT.split(back) if c != ""]
-        if len(chunks) == 1 and not _is_math(chunks[0]) and back.strip():
-            # Если пользователь вставил «голый» LaTeX без $...$, пробуем как формулу
-            try:
-                img = render_latex(back.strip())
-                body_blocks.append(("math", img))
-            except Exception:
-                log.exception("latex fallback failed, drawing as text")
-                body_blocks.append(("text", back.strip()))
-        else:
-            for chunk in chunks:
-                if _is_math(chunk):
-                    try:
-                        img = render_latex(_unwrap_math(chunk))
-                        body_blocks.append(("math", img))
-                    except Exception:
-                        log.exception("не удалось срендерить LaTeX: %s", chunk)
-                        body_blocks.append(("text", chunk))
-                elif chunk.strip():
-                    body_blocks.append(("text", chunk.strip()))
+        for paragraph in _split_paragraphs(back):
+            chunks = [c for c in _MATH_SPLIT.split(paragraph) if c != ""]
+            non_empty = [c for c in chunks if c.strip()]
+            if len(non_empty) == 1 and _is_math(non_empty[0]):
+                # Параграф — это ровно одна формула целиком: показываем
+                # крупно и по центру (главная формула карточки).
+                try:
+                    img = render_latex(_unwrap_math(non_empty[0]))
+                    body_blocks.append(("display", img))
+                except Exception:
+                    log.exception("не удалось срендерить LaTeX: %s", non_empty[0])
+                    atoms = _tokenize_paragraph(paragraph)
+                    lines, _h = _layout_flow(draw, atoms, body_font, max_text_w)
+                    body_blocks.append(("flow", lines))
+            else:
+                atoms = _tokenize_paragraph(paragraph)
+                if atoms:
+                    lines, _h = _layout_flow(draw, atoms, body_font, max_text_w)
+                    body_blocks.append(("flow", lines))
     else:
         body_blocks.append(("hidden", "формула скрыта — нажми «Показать ответ»"))
 
     for kind, payload in body_blocks:
-        if kind == "math":
+        if kind == "display":
             img = payload
             y += 8
             y += img.height + 16
         elif kind == "hidden":
             y += 80
-        else:
-            for line in textwrap.wrap(str(payload), width=52) or [""]:
-                y += 36
+        elif kind == "flow":
+            for line in payload:
+                y += int(round(line["height"])) + 10
             y += 8
 
     if footer:
@@ -262,15 +386,22 @@ def render_card(
     y += 28
 
     for kind, payload in body_blocks:
-        if kind == "math":
+        if kind == "display":
             y = _paste(canvas, payload, y + 8) + 16
         elif kind == "hidden":
             draw.text((PAD, y + 24), str(payload), font=body_font, fill=MUTED)
             y += 80
-        else:
-            for line in _wrap(draw, str(payload), body_font, CARD_W - 2 * PAD):
-                draw.text((PAD, y), line, font=body_font, fill=INK)
-                y += 36
+        elif kind == "flow":
+            for line in payload:
+                line_top = y
+                for x_off, y_off, item_kind, item_payload in line["items"]:
+                    px = PAD + int(round(x_off))
+                    py = line_top + int(round(y_off))
+                    if item_kind == "word":
+                        draw.text((px, py), item_payload, font=body_font, fill=INK)
+                    else:
+                        canvas.alpha_composite(item_payload, (px, py))
+                y += int(round(line["height"])) + 10
             y += 8
 
     if footer:
